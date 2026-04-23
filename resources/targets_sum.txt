@@ -1,0 +1,11 @@
+index	identifier	file	sum_stat	description
+0	Immune	/Users/arif/Downloads/resources/Bigwig/Immune.bw	sum	Immune
+1	Str	/Users/arif/Downloads/resources/Bigwig/Stromal.bw	sum	Str
+2	Pod	/Users/arif/Downloads/resources/Bigwig/Podocyte.bw	sum	Pod
+3	CD	/Users/arif/Downloads/resources/Bigwig/CollectingDuctIC.bw	sum	CD
+4	CFH	/Users/arif/Downloads/resources/Bigwig/ParietalEpithelial.bw	sum	CFH
+5	Tcell	/Users/arif/Downloads/resources/Bigwig/Tcell.bw	sum	Tcell
+6	End	/Users/arif/Downloads/resources/Bigwig/Endothelial.bw	sum	End
+7	DT	/Users/arif/Downloads/resources/Bigwig/DistalTubule.bw	sum	DT
+8	PT	/Users/arif/Downloads/resources/Bigwig/ProximalTubule.bw	sum	PT
+9	LOH	/Users/arif/Downloads/resources/Bigwig/LoopofHenle.bw	sum	LOH

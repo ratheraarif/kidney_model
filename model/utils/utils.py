@@ -1,0 +1,588 @@
+import numpy as np
+import sys
+import h5py
+import os
+import shutil
+import torch
+import numpy as np
+import pysam
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+
+
+
+class Train_Dataset(Dataset):
+    
+    def __init__(self, file_path, bed_path, seqlen, genome_dict, shift_aug=False, rc_aug=False, fold='train'):
+        self.file_path = file_path
+        self.bed_path = bed_path
+        self.fold = fold  # 'train' / 'valid' / 'test'
+        
+        # Load all data from HDF5
+        self.h5_file = h5py.File(self.file_path, 'r')
+        all_targets = self.h5_file['target'][:]
+        all_sequences = self.h5_file['sequence'][:]
+        all_coords = self.h5_file['coord'][:]
+        
+        # Load BED file
+        bed_file = pd.read_csv(
+            bed_path, sep='\t', names=["chrom", "start", "end", "idx_a", "fold"]
+        )
+        
+        # Create a mapping from coordinate string -> h5_index
+        coord_to_idx = {}
+        for i, coord_bytes in enumerate(all_coords):
+            coord_str = coord_bytes.decode('utf-8')  # Convert bytes to string
+            coord_to_idx[coord_str] = i
+        
+        # Match coordinates and filter by fold
+        matched_indices = []
+        matched_rows = []
+        
+        for idx, row in bed_file.iterrows():
+            # Create coordinate string in format: "chr:start-end"
+            coord_key = f"{row['chrom']}:{row['start']}-{row['end']}"
+            
+            # Check if coordinate matches AND fold matches
+            if coord_key in coord_to_idx and row['fold'] == self.fold:
+                h5_idx = coord_to_idx[coord_key]
+                matched_indices.append(h5_idx)
+                matched_rows.append(idx)
+        
+        # Store matched bed rows
+        self.bed_file = bed_file.iloc[matched_rows].reset_index(drop=True)
+        
+        # Fetch sequences and targets using matched indices
+        self.sequences = all_sequences[matched_indices]
+        self.targets = all_targets[matched_indices]
+        
+        print(f"Fold '{fold}': Matched {len(matched_indices)} regions")
+        
+        # Genome and sequence settings
+        self.seqlen = seqlen
+        self.genome_dict = genome_dict
+        self.chrom_length = {chrom: len(genome_dict[chrom]) for chrom in genome_dict}
+        
+        # Augmentations
+        self.shift_aug = shift_aug
+        self.rc_aug = rc_aug
+    
+    def resize_interval(self, chrom, start, end):
+        mid_point = (start + end) // 2
+        extend_start = mid_point - self.seqlen // 2
+        extend_end = mid_point + self.seqlen // 2
+        trimmed_start = max(0, extend_start)
+        left_pad = trimmed_start - extend_start
+        trimmed_end = min(self.chrom_length[chrom], extend_end)
+        right_pad = extend_end - trimmed_end
+        return trimmed_start, trimmed_end, left_pad, right_pad
+    
+    def get_sequence(self, chrom, start, end):
+        trimmed_start, trimmed_end, left_pad, right_pad = self.resize_interval(chrom, start, end)
+        sequence = str(self.genome_dict[chrom].seq[trimmed_start:trimmed_end]).upper()
+        sequence = 'N' * left_pad + sequence + 'N' * right_pad
+        return sequence
+    
+    def sequence_to_onehot(self, sequence):
+        mapping = {'A': [1,0,0,0],
+                   'C': [0,1,0,0],
+                   'G': [0,0,1,0],
+                   'T': [0,0,0,1],
+                   'N': [0,0,0,0]}
+        onehot = np.array([mapping.get(base, [0,0,0,0]) for base in sequence], dtype=np.float32)
+        return onehot
+    
+    def __len__(self):
+        return len(self.targets)
+    
+    def __getitem__(self, idx):
+        target = self.targets[idx]
+        row = self.bed_file.iloc[idx]
+        chrom, start, end = row['chrom'], row['start'], row['end']
+        
+        # Optional shift augmentation
+        if self.shift_aug:
+            shift = np.random.randint(-3, 4)
+            start += shift
+            end += shift
+        
+        # Extract sequence and convert to one-hot
+        sequence = self.get_sequence(chrom, start, end)
+        onehot = self.sequence_to_onehot(sequence)
+        
+        # Optional reverse complement augmentation
+        if self.rc_aug and np.random.rand() < 0.5:
+            onehot = onehot[::-1, ::-1].copy()
+            if isinstance(target, np.ndarray):
+                target = target[::-1].copy()
+        
+        return {
+            'sequence': onehot,
+            'target': target
+        }
+    
+    def close(self):
+        self.h5_file.close()
+
+def poisson_loss(pred, target):
+    return (pred - target * torch.log(pred)).mean()
+
+
+def clip_float(x, dtype=np.float16):
+    return np.clip(x, np.finfo(dtype).min, np.finfo(dtype).max)
+
+
+def initialize_output_h5(out_dir, sad_stats, snps, targets_length, targets_df, vcf_file):
+    
+    """Initialize an output HDF5 file for SAD stats."""
+
+    os.makedirs(out_dir, exist_ok=True)
+ 
+
+    shutil.copy(vcf_file, out_dir)
+
+    num_targets = targets_df.shape[0]
+    num_snps = len(snps)
+
+    sad_out = h5py.File('%s/sad.h5' % out_dir, 'w')
+
+    # write SNPs
+    snp_ids = np.array([snp.rsid for snp in snps], 'S')
+    sad_out.create_dataset('snp', data=snp_ids)
+
+    # write SNP chr
+    snp_chr = np.array([snp.chr for snp in snps], 'S')
+    sad_out.create_dataset('chr', data=snp_chr)
+
+    # write SNP pos
+    snp_pos = np.array([snp.pos for snp in snps], dtype='uint32')
+    sad_out.create_dataset('pos', data=snp_pos)
+
+    # check flips
+    snp_flips = [snp.flipped for snp in snps]
+
+    # write SNP reference allele
+    snp_refs = []
+    snp_alts = []
+    for snp in snps:
+        if snp.flipped:
+            snp_refs.append(snp.alt_alleles[0])
+            snp_alts.append(snp.ref_allele)
+        else:
+            snp_refs.append(snp.ref_allele)
+            snp_alts.append(snp.alt_alleles[0])
+    snp_refs = np.array(snp_refs, 'S')
+    snp_alts = np.array(snp_alts, 'S')
+    sad_out.create_dataset('ref_allele', data=snp_refs)
+    sad_out.create_dataset('alt_allele', data=snp_alts)
+
+    # write targets
+    sad_out.create_dataset('target_ids', data=np.array(targets_df.identifier, 'S'))
+    sad_out.create_dataset('target_labels', data=np.array(targets_df.description, 'S'))
+
+    # initialize SAD stats
+    for sad_stat in sad_stats:
+        if sad_stat in ['REF','ALT']:
+            sad_out.create_dataset(sad_stat,
+                shape=(num_snps, targets_length, num_targets),
+                dtype='float16')
+        else:            
+            sad_out.create_dataset(sad_stat,
+                shape=(num_snps, num_targets),
+                dtype='float16')
+
+    return sad_out
+
+
+
+def write_snp(ref_preds, alt_preds, sed_out, xi: int, sed_stats):
+    ref_preds_sum = ref_preds.sum(axis=0)
+    alt_preds_sum = alt_preds.sum(axis=0)
+    
+    
+    if 'SAD' in sed_stats:
+        sed = alt_preds_sum - ref_preds_sum
+        sed_out['SAD'][xi] = clip_float(sed.to(torch.float16).cpu().numpy())
+    
+    if 'logSAD' in sed_stats:
+        log_sed = torch.log2(alt_preds_sum + 1) - torch.log2(ref_preds_sum + 1)
+        sed_out['logSAD'][xi] = clip_float(log_sed.to(torch.float16).cpu().numpy())
+
+
+    if 'REF' in sed_stats:
+        sed_out['REF'][xi] = clip_float(ref_preds.to(torch.float16).cpu().numpy())
+        
+    if 'ALT' in sed_stats:
+        sed_out['ALT'][xi] = clip_float(alt_preds.to(torch.float16).cpu().numpy())
+       
+
+
+class SNP:
+    """SNP
+    Represent SNPs read in from a VCF file
+    Attributes:
+        vcf_line (str)
+    """
+    def __init__(self, vcf_line, pos2=False):
+        a = vcf_line.split()
+        # self.chr = a[0]
+        if a[0].startswith("chr"):
+            self.chr = a[0]
+        else:
+            self.chr = "chr%s" % a[0]
+        self.pos = int(a[1])
+        self.rsid = a[2]
+        self.ref_allele = a[3]
+        self.alt_alleles = a[4].split(",")
+        self.alt_allele = self.alt_alleles[0]
+        self.flipped = False
+        if self.rsid == ".":
+            self.rsid = "%s:%d" % (self.chr, self.pos)
+        self.pos2 = None
+        if pos2:
+            self.pos2 = int(a[5])
+
+    def flip_alleles(self):
+        """Flip reference and first alt allele."""
+        assert len(self.alt_alleles) == 1
+        self.ref_allele, self.alt_alleles[0] = self.alt_alleles[0], self.ref_allele
+        self.alt_allele = self.alt_alleles[0]
+        self.flipped = True
+
+    def get_alleles(self):
+        """Return a list of all alleles"""
+        alleles = [self.ref_allele] + self.alt_alleles
+        return alleles
+
+    def indel_size(self):
+        """Return the size of the indel."""
+        return len(self.alt_allele) - len(self.ref_allele)
+
+    def longest_alt(self):
+        """Return the longest alt allele."""
+        return max([len(al) for al in self.alt_alleles])
+
+    def __str__(self):
+        return "SNP(%s, %s:%d, %s/%s)" % (
+            self.rsid,
+            self.chr,
+            self.pos,
+            self.ref_allele,
+            ",".join(self.alt_alleles),
+        )
+
+
+
+
+
+
+
+
+
+
+def vcf_snps(
+    vcf_file,
+    require_sorted=False,
+    validate_ref_fasta=None,
+    flip_ref=False,
+    pos2=False,
+    start_i=None,
+    end_i=None,
+):
+    """Load SNPs from a VCF file"""
+    if vcf_file[-3:] == ".gz":
+        vcf_in = gzip.open(vcf_file, "rt")
+    else:
+        vcf_in = open(vcf_file)
+    
+    # read through header
+    line = vcf_in.readline()
+    while line and line[0] == "#":
+        line = vcf_in.readline()
+    
+    # to check sorted
+    if require_sorted:
+        seen_chrs = set()
+        prev_chr = None
+        prev_pos = -1
+    
+    # to check reference
+    if validate_ref_fasta is not None:
+        import pysam
+        genome_open = pysam.Fastafile(validate_ref_fasta)
+    
+    # read in SNPs
+    snps = []
+    si = 0
+    while line:
+        if start_i is None or (end_i is None and start_i <= si) or (start_i <= si < end_i):
+            snps.append(SNP(line, pos2))
+            
+            if require_sorted:
+                if prev_chr is not None:
+                    # same chromosome
+                    if prev_chr == snps[-1].chr:
+                        if snps[-1].pos < prev_pos:
+                            print("Sorted VCF required. Mis-ordered position: %s" % line.rstrip(), file=sys.stderr)
+                            exit(1)
+                    elif snps[-1].chr in seen_chrs:
+                        print("Sorted VCF required. Mis-ordered chromosome: %s" % line.rstrip(), file=sys.stderr)
+                        exit(1)
+                seen_chrs.add(snps[-1].chr)
+                prev_chr = snps[-1].chr
+                prev_pos = snps[-1].pos
+            
+            if validate_ref_fasta is not None:
+                ref_n = len(snps[-1].ref_allele)
+                snp_pos = snps[-1].pos - 1
+                ref_snp = genome_open.fetch(
+                    snps[-1].chr, snp_pos, snp_pos + ref_n
+                ).upper()
+                if snps[-1].ref_allele != ref_snp:
+                    if not flip_ref:
+                        # bail
+                        print("ERROR: %s does not match reference %s" % (snps[-1], ref_snp), file=sys.stderr)
+                        exit(1)
+                    else:
+                        alt_n = len(snps[-1].alt_alleles[0])
+                        ref_snp = genome_open.fetch(
+                            snps[-1].chr, snp_pos, snp_pos + alt_n
+                        ).upper()
+                        # if alt matches fasta reference
+                        if snps[-1].alt_alleles[0] == ref_snp:
+                            # flip alleles
+                            snps[-1].flip_alleles()
+                        else:
+                            # bail
+                            print("ERROR: %s does not match reference %s" % (snps[-1], ref_snp), file=sys.stderr)
+                            exit(1)
+        si += 1
+        line = vcf_in.readline()
+    
+    vcf_in.close()
+    return snps
+
+
+
+class BedDataset(Dataset):
+    def __init__(
+        self,
+        bed_path,
+        seqlen,
+        genome_dict,
+        core_length=None,   
+        shift_aug=False,
+        rc_aug=False,
+        fold="train",
+    ):
+        self.bed_path = bed_path
+        self.fold = fold
+
+        # BED columns: chrom, start, end, target, fold
+        bed_file = pd.read_csv(
+            bed_path,
+            sep="\t",
+            names=["chrom", "start", "end", "target", "fold"],
+        )
+
+        self.bed_file = bed_file[bed_file["fold"] == fold].reset_index(drop=True)
+        self.targets = self.bed_file["target"].astype(np.float32).values
+
+        assert len(self.bed_file) == len(self.targets), \
+            "Mismatch between BED rows and targets"
+
+        self.seqlen = seqlen
+        self.core_length = core_length
+        self.genome_dict = genome_dict
+        self.chrom_length = {c: len(genome_dict[c]) for c in genome_dict}
+
+        if self.core_length is not None:
+            assert self.core_length <= self.seqlen, \
+                "core_length must be <= seqlen"
+
+        self.shift_aug = shift_aug
+        self.rc_aug = rc_aug
+
+    
+    def resize_full_interval(self, chrom, start, end):
+        mid = (start + end) // 2
+        ext_start = mid - self.seqlen // 2
+        ext_end   = mid + self.seqlen // 2
+
+        trimmed_start = max(0, ext_start)
+        trimmed_end   = min(self.chrom_length[chrom], ext_end)
+
+        left_pad  = trimmed_start - ext_start
+        right_pad = ext_end - trimmed_end
+
+        return trimmed_start, trimmed_end, left_pad, right_pad
+
+    
+    def resize_core_interval(self, chrom, start, end):
+        mid = (start + end) // 2
+        half = self.core_length // 2
+
+        core_start = mid - half
+        core_end   = mid + half
+
+        trimmed_start = max(0, core_start)
+        trimmed_end   = min(self.chrom_length[chrom], core_end)
+
+        left_pad  = trimmed_start - core_start
+        right_pad = core_end - trimmed_end
+
+        return trimmed_start, trimmed_end, left_pad, right_pad
+
+    
+    def get_sequence(self, chrom, start, end):
+
+       
+        if self.core_length is None:
+            ts, te, lp, rp = self.resize_full_interval(chrom, start, end)
+            seq = str(self.genome_dict[chrom].seq[ts:te]).upper()
+            return ('N' * lp) + seq + ('N' * rp)
+
+       
+        ts, te, lp, rp = self.resize_core_interval(chrom, start, end)
+        core_seq = str(self.genome_dict[chrom].seq[ts:te]).upper()
+        core_seq = ('N' * lp) + core_seq + ('N' * rp)
+
+        # Pad to full seqlen
+        total_pad = self.seqlen - len(core_seq)
+        left_pad = total_pad // 2
+        right_pad = total_pad - left_pad
+
+        return ('N' * left_pad) + core_seq + ('N' * right_pad)
+
+   
+    def sequence_to_onehot(self, sequence):
+        mapping = {
+            'A': [1, 0, 0, 0],
+            'C': [0, 1, 0, 0],
+            'G': [0, 0, 1, 0],
+            'T': [0, 0, 0, 1],
+            'N': [0, 0, 0, 0],
+        }
+        return np.array(
+            [mapping.get(b, [0, 0, 0, 0]) for b in sequence],
+            dtype=np.float32,
+        )
+
+    
+    def __len__(self):
+        return len(self.targets)
+
+    def __getitem__(self, idx):
+        row = self.bed_file.iloc[idx]
+        chrom = row["chrom"]
+        start = int(row["start"])
+        end   = int(row["end"])
+
+        target = np.array([self.targets[idx]], dtype=np.float32)
+
+       
+        if self.shift_aug:
+            shift = np.random.randint(-3, 4)
+            start += shift
+            end   += shift
+
+        sequence = self.get_sequence(chrom, start, end)
+        onehot = self.sequence_to_onehot(sequence)
+
+        # Optional reverse-complement
+        if self.rc_aug and np.random.rand() < 0.5:
+            onehot = onehot[::-1, ::-1].copy()
+
+        return {
+            "sequence": torch.from_numpy(onehot),  
+            "target": torch.from_numpy(target),
+        }
+
+
+class VCFDataset(Dataset):
+    
+    def __init__(self, file_path, genome_dict, seqlen):
+        self.file_path = file_path
+        self.vcf_file = pd.read_csv(file_path, sep='\t', header=None, comment = '#', usecols=range(5))
+        self.vcf_file.columns = ['chrom', 'pos', 'id', 'ref', 'alt']
+        self.seqlen = seqlen
+        self.genome_dict = genome_dict
+        self.chrom_length = {chrom: len(genome_dict[chrom]) for chrom in genome_dict}
+        
+    def resize_interval(self, chrom, start, end):
+        mid_point = (start + end) // 2
+        extend_start = mid_point - self.seqlen // 2
+        extend_end = mid_point + self.seqlen // 2
+        trimmed_start = max(0, extend_start)
+        left_pad = trimmed_start - extend_start
+        trimmed_end = min(self.chrom_length[chrom], extend_end)
+        right_pad = extend_end - trimmed_end
+        return trimmed_start, trimmed_end, left_pad, right_pad
+        
+    def get_sequence(self, chrom, start, end, shift=0):
+        if shift:
+            start += shift
+            end += shift
+        trimmed_start, trimmed_end, left_pad, right_pad = self.resize_interval(chrom, start, end)
+        sequence = str(self.genome_dict[chrom].seq[trimmed_start:trimmed_end]).upper()
+        left_pad_seq = 'N' * left_pad
+        right_pad_seq = 'N' * right_pad
+        sequence = left_pad_seq + sequence + right_pad_seq
+        return sequence
+        
+    def sequence_to_onehot(self, sequence):
+        mapping = {'A': [1, 0, 0, 0], 'C': [0, 1, 0, 0], 'G': [0, 0, 1, 0],
+                   'T': [0, 0, 0, 1], 'N': [0, 0, 0, 0]}
+        onehot = np.array([mapping[base] for base in sequence], dtype=np.float32)
+        return onehot
+    
+    def __len__(self):
+        return len(self.vcf_file)
+        
+    def __getitem__(self, idx):
+        chrom, pos, ref, alt = self.vcf_file.loc[idx, ['chrom', 'pos', 'ref', 'alt']]
+        pos = pos - 1
+        if not str(chrom).startswith("chr"):
+            chrom = f"chr{chrom}"
+        ref_sequence = self.get_sequence(chrom, pos, pos + 1, shift=0)
+        assert ref_sequence[self.seqlen // 2] == ref
+        alt_sequence = ref_sequence[:self.seqlen // 2] + alt + ref_sequence[self.seqlen // 2 + 1:]
+        return {"ref_sequence": ref_sequence, "alt_sequence": alt_sequence,
+                "chrom": chrom, "pos": pos + 1, "ref": ref, "alt": alt}
+    
+    def get_shifted_sequences(self, idx, shift):
+        chrom, pos, ref, alt = self.vcf_file.loc[idx, ['chrom', 'pos', 'ref', 'alt']]
+        pos = pos - 1
+        if not str(chrom).startswith("chr"):
+            chrom = f"chr{chrom}"
+        ref_sequences, alt_sequences = [], []
+        ref_seq = self.get_sequence(chrom, pos, pos + 1, shift=shift)
+        center_idx = self.seqlen // 2 
+        original_pos_in_seq = center_idx - shift
+        if 0 <= original_pos_in_seq < len(ref_seq):
+            alt_seq = ref_seq[:original_pos_in_seq] + alt + ref_seq[original_pos_in_seq + 1:]
+        else:
+            raise ValueError(f"Ref mismatch at {chrom}:{pos+1}, shift={shift}. Expected '{ref}', got '{ref_seq[original_pos_in_seq]}'")
+        ref_sequences.append(ref_seq)
+        alt_sequences.append(alt_seq)
+        return ref_sequences, alt_sequences
+
+def rev_comp(snp: torch.Tensor) -> torch.Tensor:
+    if snp.dim() == 2:
+        rc = snp.flip(0)[:, [3, 2, 1, 0]]
+    elif snp.dim() == 3:
+        rc = snp.flip(1)[:, :, [3, 2, 1, 0]]
+    else:
+        raise ValueError("Input must have shape (L, 4) or (B, L, 4)")
+    return rc
+
+
+
+
+
+
+
+
+
+
+
