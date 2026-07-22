@@ -6,14 +6,15 @@ import h5py
 from enformer_pytorch.finetune import HeadAdapterWrapper
 import gc
 import argparse
-from Bio import SeqIO
 import pandas as pd
 import math 
 import random
+from pyfaidx import Fasta
+import pyBigWig
 
 from tqdm import tqdm
 from enformer_pytorch import from_pretrained
-from enformer_pytorch import Enformer, seq_indices_to_one_hot
+from enformer_pytorch import Enformer
 
 import wandb
 import inspect
@@ -31,94 +32,37 @@ max_lr = 3e-4
 min_lr = max_lr * 0.1
 warmup_steps = 1000
 
-def get_lr(it, warmup_steps, max_steps):
-    # 1) Linear warmup for warmup_steps
-    if it < warmup_steps:
-        return max_lr * (it + 1) / warmup_steps
-
-    # 2) If it >= max_steps, return min_lr
-    if it >= max_steps:
-        return min_lr
-
-    # 3) Cosine decay between warmup and max_steps
-    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff starts at 1 and goes to 0
-    return min_lr + coeff * (max_lr - min_lr) 
-
-
-def configure_optimizers(model, weight_decay, learning_rate, device):
-    # Start with all parameters that require gradients
-    param_dict = {pn: p for pn, p in model.named_parameters()}
-    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-
-    # Create optimizer groups
-    # Any parameter that is 2D (e.g., weights in linear layers) will have weight decay
-    # All others (biases, layernorms) will not
-    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-
-    optim_groups = [
-        {'params': decay_params, 'weight_decay': weight_decay},
-        {'params': nodecay_params, 'weight_decay': 0.0}
-    ]
-
-    num_decay_params = sum(p.numel() for p in decay_params)
-    num_nodecay_params = sum(p.numel() for p in nodecay_params)
-
-    print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-    print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-
-    
-    #fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-    #use_fused = fused_available and 'cuda' in device
-    #print(f"using fused AdamW: {use_fused}")
-
-    optimizer = torch.optim.AdamW(
-        optim_groups,
-        lr=learning_rate,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        #fused=use_fused if fused_available else False
-    )
-
-    return optimizer
-
 
 def main():
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data', default="/Users/arif/Downloads/Borzoi_enformer_ft/enformer_train_data/h5py/all_combined.h5", help='path to train data')
-    parser.add_argument('--genome', default="/Users/arif/Downloads/Borzoi_enformer_ft/resources/genome/hg38.ml.fa", help='Genome FASTA')
-    parser.add_argument('--bed_file', default="/Users/arif/Downloads/Borzoi_enformer_ft/data/overlap_with_enformer.bed", help='Targets file')
+    parser.add_argument('--targets_file', default="/path/to/targets_file.txt", help='path to train data')
+    parser.add_argument('--genome', default="/path/to/genome.fa", help='Genome FASTA')
+    parser.add_argument('--bed_file', default="path/to/sequences_human_enformer.bed", help='Targets file')
     
     args = parser.parse_args()
-        
-    if torch.cuda.is_available():
-        device = 'cuda'
-    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        device = 'mps'
+    device = "cuda"
+    
+    print(f'Using device: {device}')
+    args = parser.parse_args()
 
     print(f'Using device: {device}')
     genome = args.genome
-    genome_dict = SeqIO.to_dict(SeqIO.parse(genome, "fasta"))
-    
-    combined = args.data
-    bed_file = args.bed_file
-    model_name = "enformer_ft"
-    
-    # Create datasets
-    print("Loading training data...")
-    train_dataset = Train_Dataset(combined, bed_file, seqlen=196608, genome_dict=genome_dict,
-                             shift_aug=True, rc_aug=True, fold="train")   
+    sequences = args.bed_file
+    targets_file = args.targets_file
+    model_name = "kidformer"
 
-    val_dataset = Train_Dataset(combined, bed_file, seqlen=196608, genome_dict=genome_dict,
-                             shift_aug=False, rc_aug=False, fold="valid")   
-    
-    # Create data loaders
+    print("Loading training data...")
+
+     # Create data loaders
     batch_size = 1
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, drop_last=False, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, drop_last=False, shuffle=False, num_workers=0)
+    train_loader = make_loader(sequences, targets_file, genome,
+                      split='train', seq_len=196608, target_len=114688,
+                      batch_size=batch_size, num_workers=batch_size, shuffle=True, rc_aug=True, shift_aug=True)
+
+    val_loader = make_loader(sequences, targets_file, genome,
+                      split='valid', seq_len=196608, target_len=114688,
+                      batch_size=batch_size, num_workers=batch_size, shuffle=False, rc_aug=False, shift_aug=False) 
 
     print(f"Total training batches: {len(train_loader)} with batch size {batch_size}")
 
@@ -154,7 +98,7 @@ def main():
     wandb.init(project=model_name)
 
     loss_accum = 0.0
-    optimizer = configure_optimizers(model, weight_decay=0.1, learning_rate=6e-4, device=device)
+    optimizer = configure_optimizers(model, weight_decay=0.1, learning_rate=max_lr, device=device)
     
     step = 0 
     stepi = []
@@ -173,8 +117,8 @@ def main():
                 optimizer.zero_grad()
                 loss_accum = 0.0
             
-            seq = batch['sequence'].to(device)
-            target = batch['target'].to(device)
+            seq = batch[0].permute(0,2,1).to(device)
+            target = batch[1].to(device)
             
             
             with torch.autocast(device_type=device, dtype=torch.bfloat16):
@@ -242,8 +186,8 @@ def main():
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_loader):
-                seq = batch['sequence'].to(device)
-                target = batch['target'].to(device)
+                seq = batch[0].permute(0,2,1).to(device)
+                target = batch[1].to(device)
                 with torch.autocast(device_type=device, dtype=torch.bfloat16):
                     loss = model(seq, target=target)
                 val_losses.append(loss.item())

@@ -6,14 +6,7 @@ import random
 import numpy as np
 import pandas as pd
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-MODEL_DIR = SCRIPT_DIR.parent
-PROJECT_ROOT = SCRIPT_DIR.parents[1]
-RESOURCES_DIR = PROJECT_ROOT / "resources"
-GENOME_PATH = RESOURCES_DIR / "genome" / "hg38.ml.fa"
-CHECKPOINT_PATH = RESOURCES_DIR / "pretrained" / "borzoi_ft.pth"
-if str(MODEL_DIR) not in sys.path:
-    sys.path.append(str(MODEL_DIR))
+
 
 from Bio import SeqIO
 import h5py
@@ -26,8 +19,16 @@ from torch.utils.data import Dataset, DataLoader, Subset
 from tqdm import tqdm
 
 from utils import *
-from borzoi_pytorch import Borzoi
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+MODEL_DIR = SCRIPT_DIR.parent
+PROJECT_ROOT = SCRIPT_DIR.parents[1]
+RESOURCES_DIR = PROJECT_ROOT / "resources"
+GENOME_PATH = RESOURCES_DIR / "genome" / "hg38.ml.fa"
+CHECKPOINT_PATH = RESOURCES_DIR / "pretrained" / "borzoi_ft.pth"
+if str(MODEL_DIR) not in sys.path:
+    sys.path.append(str(MODEL_DIR))
+from borzoi_pytorch import Borzoi
 torch.set_float32_matmul_precision('high')
 
 

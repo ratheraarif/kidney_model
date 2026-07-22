@@ -55,7 +55,7 @@ This will generate the train test and val data
 
 To train the model, enformer or borzoi: run the follwoing script
 
-` python ./model/utilsfinetune_enformer.py` or `python ./model/utilsfinetune_borzoi.py`
+` python ./model/utils/train_kidformer.py` or `python ./model/utils/train_kidzoi.py`
 
 ##### to get the scores from the model
 
