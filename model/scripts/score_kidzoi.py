@@ -6,8 +6,6 @@ import random
 import numpy as np
 import pandas as pd
 
-
-
 from Bio import SeqIO
 import h5py
 import torch
@@ -25,9 +23,11 @@ MODEL_DIR = SCRIPT_DIR.parent
 PROJECT_ROOT = SCRIPT_DIR.parents[1]
 RESOURCES_DIR = PROJECT_ROOT / "resources"
 GENOME_PATH = RESOURCES_DIR / "genome" / "hg38.ml.fa"
-CHECKPOINT_PATH = RESOURCES_DIR / "pretrained" / "borzoi_ft.pth"
+CHECKPOINT_PATH = RESOURCES_DIR / "pretrained" / "kidzoi.pth"
 if str(MODEL_DIR) not in sys.path:
     sys.path.append(str(MODEL_DIR))
+
+
 from borzoi_pytorch import Borzoi
 torch.set_float32_matmul_precision('high')
 

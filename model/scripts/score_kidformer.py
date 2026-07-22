@@ -28,7 +28,7 @@ MODEL_DIR = SCRIPT_DIR.parent
 PROJECT_ROOT = SCRIPT_DIR.parents[1]
 RESOURCES_DIR = PROJECT_ROOT / "resources"
 GENOME_PATH = RESOURCES_DIR / "genome" / "hg38.ml.fa"
-DEFAULT_CHECKPOINT_PATH = RESOURCES_DIR / "pretrained" / "enformer_ft.pth"
+DEFAULT_CHECKPOINT_PATH = RESOURCES_DIR / "pretrained" / "kidformer.pth"
 if str(MODEL_DIR) not in sys.path:
     sys.path.append(str(MODEL_DIR))
 
